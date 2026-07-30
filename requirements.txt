@@ -1,0 +1,8 @@
+lhotse==1.33.0
+meeteval==0.4.3
+nemo_text_processing==1.1.0
+nemo_toolkit[all]==2.7.3
+numpy==1.26.4
+simplejson==3.19.3
+torch==2.9.1
+torchaudio==2.9.1

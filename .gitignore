@@ -1,0 +1,16 @@
+.vscode/
+scripts/local/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+exp/
+exps/
+nemo_experiments/
+outputs/
+manifests/
+*.stm
+*.rttm
+*.ckpt
+*.nemo
+wandb/
+tests/

@@ -1,0 +1,290 @@
+# DiCoP - Diarization-Conditioned Parakeet target-speaker ASR.
+#
+# FastConformer-TDT encoder (Parakeet-TDT-0.6b-v2 topology) with a per-layer FDDT block that
+# conditions each Conformer layer on a frame-level silence/target/non-target/overlap mask
+# derived from diarization. One training example is a (session, target speaker) pair.
+
+name: dicop
+seed: 1234
+
+# Evaluate before the first training step. Useful to confirm a warm start, slow otherwise.
+evaluate_at_start: false
+
+# Supplies both the tokenizer and the initial encoder/decoder/joint weights. The FDDT
+# parameters have no counterpart there and are reported as missing keys, which is expected.
+init_from_pretrained: nvidia/parakeet-tdt-0.6b-v2
+# init_from_ptl_ckpt: ???  # Resume weights (only) from a DiCoP Lightning checkpoint.
+
+model:
+  sample_rate: 16000
+  # Long sessions exhaust memory in the transducer loss; cpWER is what the model is selected on.
+  compute_eval_loss: false
+  log_prediction: true
+  skip_nan_grad: false
+
+  # Learning-rate multiplier for the FDDT parameters. 1.0 reproduces the released checkpoints:
+  # the original NeMo code built this parameter group but discarded it on the code path every
+  # config took, so the multiplier was silently a no-op. Values above 1 are the
+  # intended-but-untested behaviour, and switching away from 1.0 emits two parameter groups,
+  # which optimizer state saved by a 1.0 run cannot be resumed into.
+  fddt_lr_multiplier: 1.0
+
+  # Text normalization applied to references before tokenization and to both sides at scoring.
+  text_norm: whisper_nsf
+
+  # Token WER on training batches costs a full greedy decode every logged step.
+  log_training_wer: false
+
+  meeteval:
+    tcp_collar: 5
+    # One STM line per word. Gives tcpWER the tightest timings and matches what infer.py writes.
+    output_per_word_timestamps: true
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+
+    tdt_durations: [0, 1, 2, 3, 4]
+    num_tdt_durations: 5
+
+  train_ds:
+    # Either a NeMo JSON Lines manifest (*.jsonl) or a Lhotse CutSet (*.jsonl.gz). The format is
+    # inferred from the suffix; set `use_lhotse` explicitly to override (e.g. for a gzipped NeMo
+    # manifest). Note the two differ in one respect: a Lhotse epoch enumerates every
+    # (cut, speaker) pair, while a NeMo epoch samples one random target speaker per session.
+    manifest_filepath: ???
+    # use_lhotse: true
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: true
+    num_workers: 8
+    prefetch_factor: 2
+    pin_memory: true
+    max_duration: 10000
+    min_duration: 0.1
+    # 'average' mixes multi-channel recordings down to mono, as used for AMI-SDM.
+    channel_selector: average
+
+  validation_ds:
+    # NeMo manifest or Lhotse CutSet; see train_ds above.
+    manifest_filepath: ???
+    # use_lhotse: true
+    sample_rate: ${model.sample_rate}
+    # Full sessions are decoded in one pass, so one at a time.
+    batch_size: 1
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    prefetch_factor: 2
+    pin_memory: true
+    channel_selector: average
+
+  test_ds:
+    # NeMo manifest or Lhotse CutSet; see train_ds above.
+    manifest_filepath: null
+    # use_lhotse: true
+    sample_rate: ${model.sample_rate}
+    batch_size: 1
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+    channel_selector: average
+
+  # Left empty on purpose: the tokenizer is taken from `init_from_pretrained`. Set `dir` only
+  # if you are training without a pretrained Parakeet.
+  tokenizer:
+    dir: ""
+    type: bpe
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "per_feature"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 128
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  encoder:
+    _target_: src.model.modules.stno_encoder.ConformerEncoderSTNO
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 24
+    d_model: 1024
+    use_bias: false
+
+    # Sub-sampling parameters
+    subsampling: dw_striding
+    subsampling_factor: 8   # 8 * 10 ms = 80 ms per encoder frame, i.e. 12.5 Hz
+    subsampling_conv_channels: 256
+    causal_downsampling: false
+
+    # Reduction changes the frame rate mid-stack, which would misalign the STNO mask;
+    # ConformerEncoderSTNO refuses to run with both.
+    reduction: null
+    reduction_position: null
+    reduction_factor: 1
+
+    # Feed forward module's params
+    ff_expansion_factor: 4
+
+    # Multi-headed Attention Module's params
+    self_attention_model: rel_pos
+    n_heads: 8
+    att_context_size: [-1, -1]   # full context; see README for long-form memory notes
+    att_context_style: regular
+    xscaling: false
+    untie_biases: true
+    pos_emb_max_len: 45000       # 1 hour at 12.5 Hz
+    # Scaled dot-product attention avoids materializing the (B, H, T, T) score tensor, which
+    # at 30-minute sessions (T ~ 22500) is what decides whether a forward pass fits in memory.
+    use_pytorch_sdpa: true
+
+    # Convolution module's params
+    conv_kernel_size: 9
+    conv_norm_type: 'batch_norm'
+    conv_context_size: null
+
+    ### regularization
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+    ### FDDT conditioning. Defaults match the values hardcoded in the original implementation.
+    # Silence and non-target frames start attenuated to this scale; target and overlap frames
+    # start at identity, so an unfinetuned model already suppresses interfering speech.
+    fddt_non_target_rate: 0.5
+    fddt_is_diagonal: true      # element-wise transforms rather than d_model x d_model matrices
+    fddt_bias_only: false
+    fddt_use_silence: true
+    fddt_use_target: true
+    fddt_use_non_target: true
+    fddt_use_overlap: true
+
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 2
+      t_max: null
+      dropout: 0.2
+
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTJoint
+    log_softmax: null
+    preserve_memory: false
+
+    fuse_loss_wer: false
+    fused_batch_size: 4
+
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
+      dropout: 0.2
+
+    num_extra_outputs: ${model.model_defaults.num_tdt_durations}
+
+  decoding:
+    strategy: "greedy_batch"
+    model_type: "tdt"
+    durations: ${model.model_defaults.tdt_durations}
+
+    # Required: word timestamps are what place hypotheses on the time axis for tcpWER and for
+    # the STM output. Alignments are not needed and are expensive on long-form audio.
+    compute_timestamps: true
+    preserve_alignments: false
+
+    greedy:
+      max_symbols: 10
+
+    beam:
+      beam_size: 2
+      return_best_hypothesis: False
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  loss:
+    # Token-and-Duration Transducer, the loss Parakeet-TDT is trained with.
+    loss_name: "tdt"
+
+    tdt_kwargs:
+      fastemit_lambda: 0.0
+      clamp: -1.0
+      durations: ${model.model_defaults.tdt_durations}
+      sigma: 0.02   # under-normalization, see https://arxiv.org/abs/2304.06795
+      omega: 0.1    # weight of the regular RNN-T loss
+
+  optim:
+    name: adamw
+    lr: 0.5
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    sched:
+      name: NoamAnnealing
+      d_model: ${model.encoder.d_model}
+      warmup_steps: 2000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: 500
+  max_steps: -1
+  val_check_interval: 1.0
+  accelerator: auto
+  strategy: ddp
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  precision: bf16
+  log_every_n_steps: 10
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: False  # Provided by exp_manager
+  logger: false                # Provided by exp_manager
+  benchmark: false             # must be false for variable-length speech input
+
+exp_manager:
+  exp_dir: ???
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val/cp_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True
+  resume_from_checkpoint: null
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: ${name}
+    project: dicop
