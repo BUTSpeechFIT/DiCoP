@@ -13,6 +13,11 @@ are attenuated, so the model suppresses interfering speech before it has been tr
 The result is that a whole meeting is decoded per speaker in a single pass, with no
 segmentation, no speaker embeddings, and no separation front-end.
 
+A trained checkpoint is published at
+[BUT-FIT/DiCoP_v0.1](https://huggingface.co/BUT-FIT/DiCoP_v0.1) — pass the id straight to
+`--checkpoint` and NeMo fetches it. It is the checkpoint the [results](#results) below were
+measured with.
+
 ## Setup
 
 ```bash
@@ -117,8 +122,10 @@ python infer.py \
     --rttm /path/to/rttms/ \
     --audio-dir /path/to/audio/ \
     --output hyp.stm \
-    --checkpoint /path/to/best.ckpt
+    --checkpoint BUT-FIT/DiCoP_v0.1
 ```
+
+`--checkpoint` is a Hub id, a local `.ckpt` or a `.nemo`; see [Checkpoints](#checkpoints).
 
 `--rttm` takes a single RTTM or a directory searched recursively for `*.rttm`; segments for the
 same session id are merged. Each RTTM session id is matched to audio by trying
@@ -132,7 +139,7 @@ diarization, so no `--audio-dir` is needed:
 python infer.py \
     --cuts /path/to/cuts.jsonl.gz \
     --output hyp.stm \
-    --checkpoint /path/to/best.ckpt
+    --checkpoint BUT-FIT/DiCoP_v0.1
 ```
 
 A pre-segmented cutset holds several cuts per recording; each is decoded separately and their
@@ -189,7 +196,7 @@ builds from the manifest:
 python scripts/manifest_to_rttm.py --manifest test.jsonl --output rttms/
 python scripts/manifest_to_stm.py  --manifest test.jsonl --output ref.stm
 python infer.py --rttm rttms/ --audio-dir /data/ami --audio-glob '{session}/audio.wav' \
-                --output hyp.stm --checkpoint best.ckpt
+                --output hyp.stm --checkpoint BUT-FIT/DiCoP_v0.1
 
 meeteval-wer cpwer  -r ref.stm -h hyp.stm
 meeteval-wer tcpwer -r ref.stm -h hyp.stm --collar 5
@@ -223,7 +230,7 @@ one after another, leaving `{output-dir}/{name}/hyp.stm` next to that run's `inf
 rather than aborting the rest.
 
 ```bash
-scripts/run_inference.sh --checkpoint /path/to/best.ckpt --output-dir exps/decode-local
+scripts/run_inference.sh --checkpoint BUT-FIT/DiCoP_v0.1 --output-dir exps/decode-local
 scripts/run_scoring.sh   --decode-dir exps/decode-local
 ```
 
@@ -242,9 +249,9 @@ AliMeeting and AIShell-4 also want `--text-norm none`.
 ### Results
 
 Oracle diarization, cpWER and tcpWER (collar 5) in percent, `whisper_nsf` normalization on both
-sides — i.e. exactly what the two commands above produce, decoded with the pretrained DiCoP
-checkpoint (`dicop_stno_jsalt_pretrained.ckpt`). AMI's half-hour sessions used windowed local
-attention
+sides — i.e. exactly what the two commands above produce, decoded with
+[BUT-FIT/DiCoP_v0.1](https://huggingface.co/BUT-FIT/DiCoP_v0.1). AMI's half-hour sessions used
+windowed local attention
 (`-O model.encoder.self_attention_model=rel_pos_local_attn -O model.encoder.att_context_size=[256,256]`)
 to bound memory; every other set is full-context, full-session.
 
@@ -272,7 +279,7 @@ RTTM times at full float precision, because `%.3f` rounding moves segment edges 
 the `--cuts` hypothesis with `scripts/compare_stm.py`.
 
 ```bash
-scripts/run_rttm_parity.sh --checkpoint best.ckpt --datasets notsofar-sdm-dev1 --clean
+scripts/run_rttm_parity.sh --checkpoint BUT-FIT/DiCoP_v0.1 --datasets notsofar-sdm-dev1 --clean
 ```
 
 The two hypotheses are expected to be **identical**, not merely close. `compare_stm.py` also works
@@ -321,16 +328,6 @@ All settings live in [conf/dicop.yaml](conf/dicop.yaml). Notable ones:
 | `model.log_training_wer` | Off by default; a greedy decode every logged step is expensive. |
 | `model.encoder.reduction` | Must stay `null`: it changes the frame rate mid-stack, which would misalign the mask. The encoder refuses to run with both. |
 
-### A note on `fddt_lr_multiplier`
-
-The original in-NeMo implementation built a separate FDDT parameter group but then discarded it
-on the code path every shipped config took, so the multiplier was silently a no-op and the
-released checkpoints trained at a uniform learning rate despite being launched with
-`fddt_lr_multiplier=100`. DiCoP implements it correctly and defaults it to **1.0**, which
-reproduces those runs. Values above 1 are the intended-but-untested behaviour, and switching away
-from 1.0 emits two parameter groups, which optimizer state saved by a 1.0 run cannot be resumed
-into.
-
 ### Fine-tuning on LibriMix
 
 `scripts/run_finetune.sh` continues training an existing DiCoP checkpoint on Libri2Mix or
@@ -374,6 +371,14 @@ over to AMI or NOTSOFAR.
 ## Checkpoints
 
 `--checkpoint` accepts a Lightning `.ckpt`, a `.nemo` archive, or an NGC/HuggingFace model id.
+The released model is [BUT-FIT/DiCoP_v0.1](https://huggingface.co/BUT-FIT/DiCoP_v0.1) — a
+self-contained bundle carrying its own tokenizer, so nothing else has to be fetched:
+
+```bash
+python infer.py --checkpoint BUT-FIT/DiCoP_v0.1 \
+    --cuts /path/to/cuts.jsonl.gz --output hyp.stm
+```
+
 For a `.ckpt` or a `.nemo`, the architecture config is taken from the checkpoint itself and merged
 over the YAML, so the model matches the weights even if the config has since changed; weights then
 load with `strict=True`. A model id is instead fetched and restored by NeMo, which builds the
@@ -397,7 +402,8 @@ why loading one locally re-fetches the tokenizer from `init_from_pretrained` eve
 
 `scripts/export_to_hf.py` bundles the tokenizer in, names the archive the way NeMo expects to
 find it in a Hub repo, generates a model card, and proves the round trip by restoring the result
-and comparing it tensor by tensor against the source:
+and comparing it tensor by tensor against the source. It is what produced
+[BUT-FIT/DiCoP_v0.1](https://huggingface.co/BUT-FIT/DiCoP_v0.1):
 
 ```bash
 python scripts/export_to_hf.py \
