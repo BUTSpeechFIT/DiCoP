@@ -9,6 +9,12 @@ and validation. This differs from the NeMo-manifest dataset, which samples one r
 speaker per session per training epoch: a Lhotse epoch therefore covers every speaker of every
 cut, and is correspondingly longer.
 
+`MonoCut` and `MixedCut` are both accepted, the same pair `infer.py` decodes. A `MixedCut` (the
+LibriMix / LibriSpeechMix mixtures) names no audio file — it is a recipe for summing its tracks —
+so `load_cut_audio` renders it rather than reading a path, and `channel_selector` and `trim` do
+not apply to it. It also has no `recording`, so it becomes its own scoring session by `cut.id`.
+`MultiCut` is still rejected; see `require_supported_cut`.
+
 See `src/data/lhotse_utils.py` for why Lhotse's own dataloading stack is not used and how cut
 times map onto the NeMo manifest's.
 """
@@ -25,7 +31,7 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskTyp
 from nemo.utils import logging
 
 from src.data.dataset import _TokenizerWrapper, speech_collate_fn
-from src.data.lhotse_utils import cut_session_id, load_cut_audio, load_cutset, require_monocut
+from src.data.lhotse_utils import cut_session_id, load_cut_audio, load_cutset, require_supported_cut
 from src.data.stno import (
     SpeechSegment,
     create_stno_masks,
@@ -56,13 +62,17 @@ class LhotseToBPEAndSTNODataset(Dataset):
         tokenizer: A `nemo.collections.common.tokenizers.TokenizerSpec` subclass.
         sample_rate: Sample rate to resample loaded audio to.
         int_values: If True, load samples as 32-bit integers.
-        augmentor: Optional `AudioAugmentor` applied to the loaded waveform.
+        augmentor: Optional `AudioAugmentor` applied to the loaded waveform. `MonoCut` only —
+            a `MixedCut` is rendered by Lhotse rather than by the featurizer, which is where the
+            augmentor lives, so it is skipped there and warned about.
         max_duration: Drop cuts longer than this.
         min_duration: Drop cuts shorter than this.
         max_utts: Limit the number of cuts kept (0 means no limit).
-        trim: Trim leading/trailing silence.
+        trim: Trim leading/trailing silence. `MonoCut` only: a `MixedCut`'s own bounds already
+            define its extent.
         use_start_end_token: Add [BOS]/[EOS] around the target transcript.
-        channel_selector: Select or average channels of multi-channel audio.
+        channel_selector: Select or average channels of multi-channel audio. `MonoCut` only:
+            a rendered `MixedCut` is mono by construction.
         audio_downsampling_factor: Samples per encoder frame; sets the STNO mask frame rate.
         text_norm_type: Text normalization applied before tokenization (`None` disables it).
         val: Accepted for interface symmetry with the NeMo-manifest dataset. It does not change
@@ -135,10 +145,11 @@ class LhotseToBPEAndSTNODataset(Dataset):
 
         num_duration_filtered = 0
         num_empty = 0
+        num_mixed = 0
         total_duration = 0.0
 
         for index, cut in enumerate(self.cuts):
-            require_monocut(cut)
+            require_supported_cut(cut)
 
             if (min_duration is not None and cut.duration < min_duration) or (
                 max_duration is not None and cut.duration > max_duration
@@ -172,6 +183,8 @@ class LhotseToBPEAndSTNODataset(Dataset):
             self.session_ids[index] = cut_session_id(cut)
             self.offsets[index] = cut.start
             total_duration += cut.duration
+            if type(cut).__name__ == 'MixedCut':
+                num_mixed += 1
 
             for speaker in sorted({segment['speaker'] for segment in segments}):
                 self.spk_cut_list.append((index, speaker))
@@ -183,6 +196,17 @@ class LhotseToBPEAndSTNODataset(Dataset):
             logging.info("Filtered %d cuts by duration", num_duration_filtered)
         if num_empty:
             logging.info("Dropped %d cuts with no tokenizable transcript", num_empty)
+        if num_mixed:
+            logging.info("%d of the kept cuts are MixedCut and are rendered by Lhotse", num_mixed)
+        # The augmentor lives on the featurizer, which the MixedCut branch of `load_cut_audio`
+        # does not go through. Saying so is cheap; silently training unaugmented would not be.
+        if num_mixed and augmentor is not None:
+            logging.warning(
+                "An augmentor is configured but %d cuts are MixedCut, which are rendered by "
+                "Lhotse rather than by the featurizer the augmentor is attached to. Those cuts "
+                "will not be augmented.",
+                num_mixed,
+            )
         logging.info(
             "CutSet loaded with %d cuts totalling %.2f hours -> %d (cut, speaker) items",
             len(self.tokenized),
