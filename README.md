@@ -17,7 +17,7 @@ segmentation, no speaker embeddings, and no separation front-end.
 
 ```bash
 conda create -n dicop python=3.11 -y && conda activate dicop
-conda install -c conda-forge "ffmpeg<8" -y
+# Install cuda-toolkit if not already installed. It is only necessary for training.
 pip install -r requirements.txt
 ```
 
@@ -40,9 +40,9 @@ python -c "from numba import cuda; print(cuda.is_available())"   # must print Tr
 ## Manifest formats
 
 Two are supported interchangeably, selected by the file suffix (`.jsonl` → NeMo, `.jsonl.gz` →
-Lhotse) or by an explicit `use_lhotse` in the dataset config. They express the same thing and
-`tests/test_lhotse_dataset.py` asserts that the same data in either form produces identical
-dataset items, so you can switch without changing results.
+Lhotse) or by an explicit `use_lhotse` in the dataset config. They express the same thing — the
+same data in either form produces identical dataset items — so you can switch without changing
+results.
 
 ### NeMo JSON Lines
 
@@ -215,6 +215,70 @@ scripts/run_scoring.sh --decode-dir exps/decode-local
 The `meeteval-wer` CLI needs `simplejson` (in `requirements.txt`); the Python API
 (`meeteval.wer.cpwer`) does not.
 
+## Evaluation
+
+`scripts/run_inference.sh` decodes a checkpoint over a whole set of prepared evaluation corpora,
+one after another, leaving `{output-dir}/{name}/hyp.stm` next to that run's `infer.log`;
+`scripts/run_scoring.sh` then scores every one of them. A failing set is reported at the end
+rather than aborting the rest.
+
+```bash
+scripts/run_inference.sh --checkpoint /path/to/best.ckpt --output-dir exps/decode-local
+scripts/run_scoring.sh   --decode-dir exps/decode-local
+```
+
+`--datasets` takes names or name prefixes (`--datasets ami,notsofar`, `--datasets all`), `--list`
+prints the known sets and their resolved paths, `--dry-run` prints the commands only, and
+everything after `--` is appended to every `infer.py` call. Both scripts read their corpora from a
+prepared `mt-asr-data-prep` checkout — `MANIFEST_ROOT` and `DATA_ROOT` (or `--manifest-root` /
+`--data-root`) point them elsewhere, and the defaults are machine-local paths that will not exist
+on your machine.
+
+Sets whose cutsets are `MultiCut` take the RTTM route instead: their paired NeMo manifest is turned
+into an oracle RTTM and the array is mixed down with `--channel-selector average`. `run_scoring.sh`
+cannot recover a source manifest from those runs' logs, so name it with `--manifest NAME=PATH`;
+AliMeeting and AIShell-4 also want `--text-norm none`.
+
+### Results
+
+Oracle diarization, cpWER and tcpWER (collar 5) in percent, `whisper_nsf` normalization on both
+sides — i.e. exactly what the two commands above produce, decoded with the pretrained DiCoP
+checkpoint (`dicop_stno_jsalt_pretrained.ckpt`). AMI's half-hour sessions used windowed local
+attention
+(`-O model.encoder.self_attention_model=rel_pos_local_attn -O model.encoder.att_context_size=[256,256]`)
+to bound memory; every other set is full-context, full-session.
+
+| Set | Sessions | cpWER | tcpWER |
+|---|---|---|---|
+| AMI-SDM dev / test | 18 / 16 | 13.98 / 15.97 | 14.26 / 16.51 |
+| AMI-IHM-mix dev / test | 18 / 16 | 11.20 / 11.75 | 11.41 / 12.15 |
+| NOTSOFAR-SDM dev1 / eval | 177 / 160 | 17.44 / 17.56 | 17.93 / 17.94 |
+| LibriSpeechMix 2mix dev / test | 2703 / 2620 | 2.62 / 2.54 | 2.62 / 2.54 |
+| LibriSpeechMix 3mix dev / test | 2703 / 2620 | 6.79 / 6.34 | 6.80 / 6.35 |
+| Libri2Mix dev / test clean | 3000 | 4.13 / 4.40 | 4.16 / 4.41 |
+| Libri3Mix dev / test clean | 3000 | 30.93 / 33.12 | 31.00 / 33.19 |
+
+Libri3Mix is the outlier because three fully overlapped speakers at t=0 is the hardest condition
+the mask can describe and the furthest from the meeting data the checkpoint was trained on; see
+the fine-tuning note below.
+
+### Checking the two inference routes agree
+
+A cutset and an RTTM-plus-audio-directory express the same thing, so decoding an export of a cutset
+must reproduce decoding the cutset. `scripts/run_rttm_parity.sh` checks that end to end: it exports
+each set with `scripts/cutset_to_wav_rttm.py` (audio rendered through the loader `infer.py` uses,
+RTTM times at full float precision, because `%.3f` rounding moves segment edges into neighbouring
+80 ms mask frames), decodes the export with `--rttm --audio-dir`, and compares the result against
+the `--cuts` hypothesis with `scripts/compare_stm.py`.
+
+```bash
+scripts/run_rttm_parity.sh --checkpoint best.ckpt --datasets notsofar-sdm-dev1 --clean
+```
+
+The two hypotheses are expected to be **identical**, not merely close. `compare_stm.py` also works
+standalone on any two STMs over the same sessions, and reports the cpWER of one against the other
+so a handful of differing words is not read as a wholesale mismatch.
+
 ## Training
 
 ```bash
@@ -310,11 +374,15 @@ over to AMI or NOTSOFAR.
 ## Checkpoints
 
 `--checkpoint` accepts a Lightning `.ckpt`, a `.nemo` archive, or an NGC/HuggingFace model id.
-For a `.ckpt`, the architecture config is taken from the checkpoint itself and merged over the
-YAML, so the model matches the weights even if the config has since changed; weights then load
-with `strict=True`. Checkpoints produced by the original in-NeMo implementation load unchanged —
-the encoder's old module path is aliased to this repository's class, and the parameter names are
-identical.
+For a `.ckpt` or a `.nemo`, the architecture config is taken from the checkpoint itself and merged
+over the YAML, so the model matches the weights even if the config has since changed; weights then
+load with `strict=True`. A model id is instead fetched and restored by NeMo, which builds the
+encoder before any override could reach its constructor: `--att-context-size` and
+`model.encoder.self_attention_model` still take effect (the attention layers are rebuilt and the
+trained weights carried across), and anything else is reported as ignored rather than applied.
+
+Checkpoints produced by the original in-NeMo implementation load unchanged — the encoder's old
+module path is aliased to this repository's class, and the parameter names are identical.
 
 `transcribe()` is deliberately disabled on these models. NeMo's transcription path cannot supply
 a mask, and an unconditioned encoder returns a fluent transcript of whoever is loudest, which
@@ -352,59 +420,35 @@ outside the `nemo` package, so a consumer has to import DiCoP and call
 
 ```
 train.py                           training entrypoint (Hydra)
-infer.py                           RTTM + audio directory -> STM
+infer.py                           RTTM + audio, or a Lhotse CutSet -> STM
 conf/dicop.yaml                    the single config
 src/data/stno.py                   the STNO mask math, shared by training and inference
 src/data/dataset.py                (session, target speaker) dataset, NeMo manifests
 src/data/collections.py            NeMo manifest parsing
 src/data/lhotse_dataset.py         (cut, target speaker) dataset, Lhotse CutSets
 src/data/lhotse_utils.py           cut adapters, shared by training and inference
+src/data/dataloader.py             picks the dataset class per manifest format, builds the loader
+src/data/text_norm/                the text normalizers (`whisper_nsf` and friends)
 src/metrics/meeteval_mt_wer.py     cpWER / tcpWER + STM dumping
 src/model/asr_model.py             EncDecRNNTModelSTNO
 src/model/asr_bpe_model.py         EncDecRNNTBPEModelSTNO
 src/model/modules/fddt.py          the per-class frame transform
 src/model/modules/stno_encoder.py  FastConformer + per-layer FDDT
 utils/{rttm,audio,stm}.py          RTTM parsing, audio resolution, STM writing
+utils/inference.py                 checkpoint loading and the batched decoding runtime
+utils/nemo.py                      NeMo interop: external `_target_`s, legacy aliases, ckpt loading
 scripts/export_to_hf.py            checkpoint -> self-contained .nemo bundle for the HF Hub
-scripts/                           manifest -> RTTM / STM, manifest retargeting, cutset subsetting,
-                                   eval-set and fine-tuning runners
-tests/                             parity tests against the original implementation
+scripts/run_{inference,scoring}.sh decode a checkpoint over the eval sets, then score them
+scripts/run_finetune.sh            LibriMix fine-tuning runner
+scripts/run_rttm_parity.sh         checks the --cuts and --rttm routes decode identically,
+                                   with cutset_to_wav_rttm.py and compare_stm.py
+scripts/                           manifest -> RTTM / STM, manifest retargeting, cutset subsetting
 ```
 
 DiCoP depends on the pip-installed `nemo_toolkit` and subclasses it rather than forking it.
 `src/data/stno.py` is deliberately the single source of truth for the mask, so the training
 dataset and `infer.py` cannot drift apart.
 
-## Tests
-
-```bash
-python -m pytest tests/ -q
-```
-
-The parity tests import the original in-NeMo implementation from `/home/jovyan/NeMo` when it is
-present (and skip otherwise, overridable with `DICOP_NEMO_FORK`) and assert bit-identical encoder
-outputs and item-for-item dataset equality. `tests/test_encoder_parity.py` also checks that with
-no mask the encoder reduces exactly to stock `ConformerEncoder`, which is the alarm that fires if
-a NeMo upgrade changes the `forward_internal` body this repository copies.
-
-`tests/test_lhotse_dataset.py` pins the two manifest formats against each other, on both a
-synthetic corpus and real AMI cutsets (`DICOP_CUTSET_ROOT`, default
-`/home/jovyan/mt-asr-data-prep/manifests`).
-
-## Citation
-
-```
-@misc{klement2026descriptionchime9mcorecchallenge,
-      title={BUT System Description for CHiME-9 MCoRec Challenge},
-      author={Dominik Klement and Alexander Polok and Nguyen Hai Phong and Prachi Singh and Lukáš Burget},
-      year={2026},
-      eprint={2604.27436},
-      archivePrefix={arXiv},
-      primaryClass={eess.AS},
-      url={https://arxiv.org/abs/2604.27436},
-}
-```
-
 ## Contact
 
-[iklement@fit.vut.cz](mailto:iklement@fit.vut.cz)
+If you have any questions, reach out to: [iklement@fit.vut.cz](mailto:iklement@fit.vut.cz)

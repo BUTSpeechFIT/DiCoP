@@ -60,7 +60,7 @@ TOKENIZER_ARTIFACTS = (
 )
 
 BASE_MODEL = "nvidia/parakeet-tdt-0.6b-v2"
-PROJECT_URL = "https://github.com/BUT-FIT/DiCoP"
+PROJECT_URL = "https://github.com/BUTSpeechFIT/DiCoP"
 
 MODEL_CARD_TEMPLATE = """\
 ---
@@ -138,18 +138,9 @@ mask, and an unconditioned encoder returns a fluent transcript of whoever is lou
 looks correct but is not target-speaker output. Use `infer.py`, or `transcribe_stno()` with an
 STNO mask you build yourself (see `src/data/stno.py`).
 
-## Citation
+## Contact
 
-```
-@misc{{klement2026descriptionchime9mcorecchallenge,
-      title={{BUT System Description for CHiME-9 MCoRec Challenge}},
-      author={{Dominik Klement and Alexander Polok and Nguyen Hai Phong and Prachi Singh and Lukáš Burget}},
-      year={{2026}},
-      eprint={{2604.27436}},
-      archivePrefix={{arXiv}},
-      primaryClass={{eess.AS}},
-      url={{https://arxiv.org/abs/2604.27436}},
-}}
+If you have any questions, reach out to: [iklement@fit.vut.cz](mailto:iklement@fit.vut.cz)
 ```
 """
 
