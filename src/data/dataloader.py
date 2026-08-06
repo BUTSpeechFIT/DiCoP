@@ -16,6 +16,7 @@ from nemo.utils import logging
 
 from src.data.dataset import AudioToBPEAndSTNODataset
 from src.data.lhotse_dataset import LhotseToBPEAndSTNODataset
+from src.data.lhotse_utils import manifest_paths
 
 __all__ = ['get_stno_dataloader', 'uses_lhotse_manifest']
 
@@ -25,17 +26,29 @@ LHOTSE_SUFFIXES = ('.jsonl.gz', '.jsonl.gzip')
 def uses_lhotse_manifest(config: DictConfig) -> bool:
     """Whether this dataset section points at a Lhotse CutSet rather than a NeMo manifest.
 
-    An explicit `use_lhotse` always wins. Otherwise the format is inferred from the suffix,
-    since a CutSet is conventionally `.jsonl.gz` while DiCoP's NeMo manifests are plain
-    `.jsonl`. Set `use_lhotse: false` if you keep NeMo manifests gzipped.
+    An explicit `use_lhotse` always wins. Otherwise the format is inferred from the suffix of the
+    first manifest, since a CutSet is conventionally `.jsonl.gz` while DiCoP's NeMo manifests are
+    plain `.jsonl`. Set `use_lhotse: false` if you keep NeMo manifests gzipped.
+
+    Several manifests may be given (as a list, or comma-separated), in which case they must all
+    be the same format — one dataset reads them all.
     """
     if config.get('use_lhotse') is not None:
         return bool(config['use_lhotse'])
 
     manifest = config.get('manifest_filepath')
-    if isinstance(manifest, (list, tuple)):
-        manifest = manifest[0] if manifest else None
-    return bool(manifest) and str(manifest).endswith(LHOTSE_SUFFIXES)
+    if not manifest:
+        return False
+
+    paths = manifest_paths(manifest)
+    is_lhotse = [path.endswith(LHOTSE_SUFFIXES) for path in paths]
+    if any(is_lhotse) and not all(is_lhotse):
+        raise ValueError(
+            f"Mixed manifest formats in {list(paths)}: a dataset reads either Lhotse CutSets "
+            f"({'/'.join(LHOTSE_SUFFIXES)}) or NeMo manifests, not both. Set `use_lhotse` "
+            f"explicitly if the suffixes are misleading."
+        )
+    return is_lhotse[0]
 
 
 def get_stno_dataloader(

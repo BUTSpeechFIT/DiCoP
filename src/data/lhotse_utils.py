@@ -30,8 +30,10 @@ mixture only exists once Lhotse renders it — so it is read with `cut.load_audi
 afterwards if needed.
 """
 
+from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import torch
 
@@ -45,9 +47,96 @@ __all__ = [
     'cut_speakers',
     'load_cut_audio',
     'load_cutset',
+    'manifest_paths',
+    'manifest_stem',
+    'named_manifests',
     'require_monocut',
     'require_supported_cut',
 ]
+
+# Stripped, in this order, to turn a manifest path into a dataset name. `Path.stem` alone leaves
+# the `.jsonl` of a `.jsonl.gz` cutset behind.
+MANIFEST_SUFFIXES = (('.gz', '.gzip'), ('.jsonl', '.json'))
+
+
+def manifest_paths(manifest_filepath) -> List[str]:
+    """The manifest paths a `manifest_filepath` config value names, in order.
+
+    Accepts a single path, a comma-separated string (the convention the NeMo-manifest dataset
+    already follows), or any sequence — including the `ListConfig` a Hydra list override such as
+    `model.train_ds.manifest_filepath=[a.jsonl.gz,b.jsonl.gz]` produces, which is not a `list`
+    and so is missed by an `isinstance(..., list)` test.
+
+    All of these name **one** dataset, which reads them all. A mapping is rejected: it names one
+    dataset per entry, which only the evaluation sections support (see `named_manifests`).
+    """
+    if isinstance(manifest_filepath, Mapping):
+        raise ValueError(
+            f"A mapping of {len(manifest_filepath)} named manifests cannot build a single "
+            f"dataset. Only `validation_ds` and `test_ds` evaluate one dataset per name; pass a "
+            f"list or a comma-separated string here to read them as one set. "
+            f"Got {list(manifest_filepath)}."
+        )
+
+    if isinstance(manifest_filepath, (str, Path)):
+        candidates = str(manifest_filepath).split(',')
+    else:
+        candidates = [str(path) for path in manifest_filepath]
+
+    paths = [path.strip() for path in candidates if str(path).strip()]
+    if not paths:
+        raise ValueError(f"No manifest path in {manifest_filepath!r}.")
+    return paths
+
+
+def manifest_stem(path: Union[str, Path]) -> str:
+    """The dataset name a manifest path implies: its file name without the manifest suffixes.
+
+    `.../librimix_cutset_dev-clean.jsonl.gz` -> `librimix_cutset_dev-clean`.
+    """
+    name = Path(str(path).strip()).name
+    for group in MANIFEST_SUFFIXES:
+        for suffix in group:
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+    return name
+
+
+def named_manifests(manifest_filepath) -> List[Tuple[str, object]]:
+    """The `(name, manifest)` pairs an evaluation `manifest_filepath` names, in order.
+
+    Every manifest is a dataset of its own, inferred and scored separately under `val/<name>/`.
+    A mapping names them explicitly, and is the only form that pools several manifests into one
+    score, since its value is passed through untouched and may itself be a list or a
+    comma-separated string. Any other form goes through `manifest_paths`, and each path is named
+    after its file stem.
+    """
+    if isinstance(manifest_filepath, Mapping):
+        pairs = [(str(name), manifest) for name, manifest in manifest_filepath.items()]
+        if not pairs:
+            raise ValueError(f"No manifest in {manifest_filepath!r}.")
+    else:
+        pairs = [(manifest_stem(path), path) for path in manifest_paths(manifest_filepath)]
+
+    for name, manifest in pairs:
+        if not name or '/' in name:
+            raise ValueError(
+                f"{name!r} (from {manifest!r}) cannot name a dataset: the name becomes a metric "
+                f"key segment (`val/<name>/cp_wer`) and a predictions subdirectory, so it must be "
+                f"non-empty and free of '/'."
+            )
+
+    counts = Counter(name for name, _ in pairs)
+    duplicates = sorted(name for name, count in counts.items() if count > 1)
+    if duplicates:
+        raise ValueError(
+            f"Two evaluation manifests resolved to the same dataset name: {duplicates}. Names are "
+            f"taken from the file stem, which collides for identically-named files in different "
+            f"directories. Name them explicitly instead, as "
+            f"manifest_filepath=\"{{ami:'/a/dev.jsonl.gz',notsofar:'/b/dev.jsonl.gz'}}\"."
+        )
+    return pairs
 
 
 def load_cutset(path: Union[str, Path]):

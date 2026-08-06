@@ -284,9 +284,9 @@ def attach_tokenizer(model, tokenizer_dir: Path) -> None:
     """Register the tokenizer files so `save_to` bundles them into the archive.
 
     Registration is done by hand rather than through `_setup_tokenizer`, which would build a
-    fresh tokenizer and bind it to `model.tokenizer` while `model.decoding`, `model.wer` and
-    `model.meeteval_mt_wer` still held the old object — and the decoder and joint were sized from
-    that old object's vocabulary. Registering the artifacts leaves the loaded model untouched.
+    fresh tokenizer and bind it to `model.tokenizer` while `model.decoding` and `model.wer` still
+    held the old object — and the decoder and joint were sized from that old object's vocabulary.
+    Registering the artifacts leaves the loaded model untouched.
 
     At save time `_handle_artifacts` copies each file into the archive under a uuid name and
     `_update_artifact_paths` writes `nemo:<uuid>_<name>` into the stored config, creating the

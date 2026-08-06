@@ -40,7 +40,7 @@ from nemo.utils.get_rank import get_rank, is_global_rank_zero
 
 from src.data.text_norm import get_text_norm
 
-__all__ = ['MeetevalMTWER']
+__all__ = ['MeetevalMTWER', 'pool_results']
 
 # Hypotheses whose words are farther apart than this are split into separate STM segments
 # when `output_per_word_timestamps` is False.
@@ -51,6 +51,21 @@ def get_world_size() -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_world_size()
     return 1
+
+
+def pool_results(results: List[Dict]) -> Dict:
+    """Sum several cpWER/tcpWER results into one, as scoring their union in a single pass would.
+
+    Every count is per (session, speaker), so the error and reference-length counts simply add up
+    and the rate is recomputed from the totals. Used to reduce the per-rank shards of one dataset,
+    and by the model to pool separately-scored datasets into the single number checkpoints are
+    selected on.
+    """
+    pooled = {key: sum(res[key] for res in results) for key in ('ins', 'del', 'sub', 'len')}
+    pooled['wer'] = (
+        (pooled['sub'] + pooled['ins'] + pooled['del']) / pooled['len'] if pooled['len'] else 0.0
+    )
+    return pooled
 
 
 class MeetevalMTWER(Metric):
@@ -214,14 +229,6 @@ class MeetevalMTWER(Metric):
             output['del'] += res[i].deletions
             output['sub'] += res[i].substitutions
         return output
-
-    @staticmethod
-    def _reduce_res(res_all_ranks: List[Dict]):
-        res = {k: 0 for k in res_all_ranks[0]}
-        for res_rank in res_all_ranks:
-            for k in res:
-                res[k] += res_rank[k]
-        return res
 
     def _reference_segments(self, targets_collection) -> Dict[int, List[SegLstSegment]]:
         """Build reference STM segments from the whole dataset, keyed by manifest row id.
@@ -414,10 +421,19 @@ class MeetevalMTWER(Metric):
             segments=[seg for uid in pred_segment_ids[begin_idx:end_idx] for seg in pred_segments[uid]]
         )
 
-        res_cp = self._process_metric_res(meeteval.wer.cpwer(reference=gt_seg_lst, hypothesis=pred_seg_lst))
-        res_tcp = self._process_metric_res(
-            meeteval.wer.tcpwer(reference=gt_seg_lst, hypothesis=pred_seg_lst, collar=self.tcp_collar)
-        )
+        if gt_seg_lst.segments:
+            res_cp = self._process_metric_res(
+                meeteval.wer.cpwer(reference=gt_seg_lst, hypothesis=pred_seg_lst)
+            )
+            res_tcp = self._process_metric_res(
+                meeteval.wer.tcpwer(reference=gt_seg_lst, hypothesis=pred_seg_lst, collar=self.tcp_collar)
+            )
+        else:
+            # Fewer rows than ranks leaves the last ranks with nothing to score, which meeteval
+            # rejects as an empty reference. Zero counts are the right contribution to the sum.
+            # Small per-dataset validation subsets hit this readily: 4 AMI dev cuts on 8 GPUs
+            # gives half the ranks an empty shard.
+            res_cp, res_tcp = self._process_metric_res({}), self._process_metric_res({})
 
         res_both_all_ranks = [None] * world_size
         if world_size > 1:
@@ -425,10 +441,8 @@ class MeetevalMTWER(Metric):
         else:
             res_both_all_ranks[0] = (res_cp, res_tcp)
 
-        res_cp = self._reduce_res([res[0] for res in res_both_all_ranks])
-        res_tcp = self._reduce_res([res[1] for res in res_both_all_ranks])
-        for res in (res_cp, res_tcp):
-            res['wer'] = (res['sub'] + res['ins'] + res['del']) / res['len'] if res['len'] else 0.0
+        res_cp = pool_results([res[0] for res in res_both_all_ranks])
+        res_tcp = pool_results([res[1] for res in res_both_all_ranks])
 
         if save_stm_path is not None and is_global_rank_zero():
             gt_seglist = SegLST(segments=[seg for uid in gt_segment_ids for seg in gt_segments[uid]])

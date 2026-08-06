@@ -91,7 +91,9 @@ class EncDecRNNTBPEModelSTNO(EncDecRNNTModelSTNO, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
-        self.meeteval_mt_wer = self._build_meeteval_metric()
+        # The multi-talker metrics are not built here: there is one per evaluation dataloader and
+        # the dataloaders are set up by `ModelPT.__init__` above, before `self.decoding` exists.
+        # `EncDecRNNTModelSTNO._build_eval_metrics` builds them at each evaluation epoch start.
 
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
@@ -144,10 +146,8 @@ class EncDecRNNTBPEModelSTNO(EncDecRNNTModelSTNO, ASRBPEMixin):
             dist_sync_on_step=True,
         )
 
-        # Unlike NeMo's version, the multi-talker metric also has to be rebuilt: it decodes
-        # through `self.decoding`, so leaving it bound to the old object would silently keep
-        # scoring with the previous strategy.
-        self.meeteval_mt_wer = self._build_meeteval_metric()
+        # The multi-talker metrics decode through `self.decoding` too, but they are rebuilt at
+        # every evaluation epoch start, so they pick the new strategy up on their own.
 
         # Setup fused Joint step
         if self.joint.fuse_loss_wer or (

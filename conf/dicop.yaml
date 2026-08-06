@@ -67,7 +67,13 @@ model:
     channel_selector: average
 
   validation_ds:
-    # NeMo manifest or Lhotse CutSet; see train_ds above.
+    # NeMo manifest or Lhotse CutSet; see train_ds above. Unlike train_ds, every manifest here is
+    # a dataset of its own: it is decoded and scored separately and logged under
+    # `val/<name>/cp_wer`, alongside a `val/cp_wer` pooled over all of them, which is what
+    # `exp_manager` selects checkpoints on. A single path or a comma-separated list names its
+    # datasets after the manifest file stems; a mapping names them itself, and is the only way to
+    # score several manifests as one set:
+    #   manifest_filepath="{ami:'/a/dev.jsonl.gz',notsofar:'/b/dev1.jsonl.gz,/b/dev2.jsonl.gz'}"
     manifest_filepath: ???
     # use_lhotse: true
     sample_rate: ${model.sample_rate}
@@ -81,7 +87,7 @@ model:
     channel_selector: average
 
   test_ds:
-    # NeMo manifest or Lhotse CutSet; see train_ds above.
+    # NeMo manifest or Lhotse CutSet; scored per dataset under `test/<name>/`, see validation_ds.
     manifest_filepath: null
     # use_lhotse: true
     sample_rate: ${model.sample_rate}

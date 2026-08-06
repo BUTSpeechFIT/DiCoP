@@ -7,7 +7,7 @@ conditioning requires:
   - the training/validation batches carry the mask, the manifest row id and the target
     speaker index alongside the usual audio and transcript;
   - validation scores multi-talker cpWER/tcpWER with `MeetevalMTWER` instead of token WER,
-    and writes `ref.stm` / `hyp.stm` per validation epoch;
+    one dataset at a time, and writes `ref.stm` / `hyp.stm` per dataset per validation epoch;
   - `transcribe()` is disabled because NeMo's transcription path cannot supply a mask, and
     silently decoding without conditioning would produce plausible-looking wrong output.
     `transcribe_stno()` is the conditioned replacement, used by `infer.py`.
@@ -16,6 +16,7 @@ Everything else - the module construction, the TDT loss, optimizer setup, export
 inherited from NeMo unchanged.
 """
 
+import copy
 import os
 from typing import Dict, List, Optional, Union
 
@@ -31,7 +32,32 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.core.neural_types import LengthsType, MaskType, NeuralType
 from nemo.utils import logging
 
+from src.data.lhotse_utils import named_manifests
+from src.metrics.meeteval_mt_wer import pool_results
+
 __all__ = ['EncDecRNNTModelSTNO']
+
+# Where each evaluation stage keeps its state on the model. The dataloaders, NeMo's own display
+# names and its "which loader owns the unprefixed metrics" index are NeMo's attributes; the
+# dataset names and the per-dataloader metrics are this model's.
+EVAL_STAGES = {
+    'validation': {
+        'prefix': 'val',
+        'dataloaders': '_validation_dl',
+        'nemo_names': '_validation_names',
+        'dl_idx': '_val_dl_idx',
+        'names': '_validation_dataset_names',
+        'metrics': '_validation_metrics',
+    },
+    'test': {
+        'prefix': 'test',
+        'dataloaders': '_test_dl',
+        'nemo_names': '_test_names',
+        'dl_idx': '_test_dl_idx',
+        'names': '_test_dataset_names',
+        'metrics': '_test_metrics',
+    },
+}
 
 
 class EncDecRNNTModelSTNO(EncDecRNNTModel):
@@ -151,7 +177,7 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
             if AccessMixin.is_access_enabled(self.model_guid):
                 AccessMixin.reset_registry(self)
 
-            tensorboard_logs = {
+            logs_dict = {
                 'train_loss': loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
@@ -166,7 +192,7 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
                 )
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
-                tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+                logs_dict.update({'training_batch_wer': scores.float() / words})
 
         else:
             compute_wer = log_training_wer and (sample_id + 1) % log_every_n_steps == 0
@@ -188,16 +214,16 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
             if AccessMixin.is_access_enabled(self.model_guid):
                 AccessMixin.reset_registry(self)
 
-            tensorboard_logs = {
+            logs_dict = {
                 'train_loss': loss_value,
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
 
             if compute_wer:
-                tensorboard_logs.update({'training_batch_wer': wer})
+                logs_dict.update({'training_batch_wer': wer})
 
-        self.log_dict(tensorboard_logs)
+        self.log_dict(logs_dict)
 
         # Preserve batch acoustic model T and language model U parameters if normalizing
         if self._optim_normalize_joint_txu:
@@ -241,18 +267,18 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
             )
         del signal
 
-        tensorboard_logs = {}
+        logs_dict = {}
 
         if self.compute_eval_loss:
             decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
-            tensorboard_logs['val_loss'] = self.loss(
+            logs_dict['val_loss'] = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
 
         # Multi-talker scoring replaces token WER: hypotheses are accumulated per
-        # (session, speaker) here and scored once per epoch in `multi_validation_epoch_end`.
-        self.meeteval_mt_wer.update(
+        # (session, speaker) here and scored once per epoch in `_eval_epoch_end`.
+        self._eval_metric(dataloader_idx).update(
             predictions=encoded,
             predictions_lengths=encoded_len,
             utt_ids=utt_ids,
@@ -261,11 +287,15 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
 
-        return tensorboard_logs
+        return logs_dict
 
-    def _stm_output_dir(self) -> str:
+    def _stm_output_dir(self, name: Optional[str] = None) -> str:
+        """Where one dataset's `ref.stm` / `hyp.stm` go, in `run_inference.sh`'s `{name}/` layout."""
         log_dir = self.trainer.log_dir if self.trainer is not None else '.'
-        path = os.path.join(log_dir or '.', f'preds_{self.current_epoch}_{self.trainer.global_step}')
+        parts = [log_dir or '.', f'preds_{self.current_epoch}_{self.trainer.global_step}']
+        if name:
+            parts.append(name)
+        path = os.path.join(*parts)
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -289,35 +319,111 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
             f"`manifest_processor`, so multi-talker scoring cannot find its references."
         )
 
-    def _multi_epoch_end(self, outputs, dataloader, dataloader_idx: int, prefix: str):
-        """Score the accumulated hypotheses and dump the STMs. Shared by val and test."""
-        loss_key = f'{prefix}_loss'
-        if self.compute_eval_loss:
-            loss_mean = torch.stack([x[loss_key] for x in outputs]).mean()
-            loss_log = {loss_key: loss_mean}
-        else:
-            loss_log = {}
+    def _score_eval_dataloader(self, outputs, stage: str, dataloader_idx: int, name: Optional[str]):
+        """Score one dataset's accumulated hypotheses and dump its STMs.
 
-        save_stm_path = self._stm_output_dir()
-        logging.info("Saving %s predictions to %s", prefix, save_stm_path)
+        Returns the log entries for this dataset, keyed `val/<name>/cp_wer` and so on, together
+        with the raw cpWER and tcpWER counts, which `_eval_epoch_end` sums into the pooled number
+        checkpoints are selected on.
+        """
+        stage_attrs = EVAL_STAGES[stage]
+        prefix = stage_attrs['prefix']
+        scope = f'{prefix}/{name}' if name else prefix
 
-        cp_res, tcp_res = self.meeteval_mt_wer.compute(
-            self._dataloader_collection(dataloader, dataloader_idx), save_stm_path=save_stm_path
+        save_stm_path = self._stm_output_dir(name)
+        logging.info("Saving %s predictions to %s", scope, save_stm_path)
+
+        metric = self._eval_metrics(stage)[dataloader_idx]
+        cp_res, tcp_res = metric.compute(
+            self._dataloader_collection(getattr(self, stage_attrs['dataloaders']), dataloader_idx),
+            save_stm_path=save_stm_path,
         )
-        self.meeteval_mt_wer.reset()
+        metric.reset()
 
-        metrics = {}
-        for name, res in (('cp', cp_res), ('tcp', tcp_res)):
+        logs = {}
+        if self.compute_eval_loss:
+            logs[f'{scope}/loss'] = torch.stack([x[f'{prefix}_loss'] for x in outputs]).mean()
+        for metric_name, res in (('cp', cp_res), ('tcp', tcp_res)):
             for key in ('wer', 'ins', 'del', 'sub', 'len'):
-                metrics[f'{prefix}/{name}_{key}'] = float(res[key])
+                logs[f'{scope}/{metric_name}_{key}'] = float(res[key])
 
-        return {**loss_log, 'log': {**loss_log, **metrics}}
+        return logs, cp_res, tcp_res
+
+    def _eval_epoch_end(self, stage: str):
+        """Score every dataset of `stage` separately, then log them and their pooled aggregate.
+
+        Replaces `ModelPT.on_validation_epoch_end`, which prefixes the second and later
+        dataloaders' metrics as `<name>_val/cp_wer` and has nowhere to put a number pooled across
+        them. `exp_manager` selects checkpoints on `val/cp_wer`, so that number has to exist
+        however many datasets are configured — with one it is simply that dataset's own.
+        """
+        stage_attrs = EVAL_STAGES[stage]
+        prefix = stage_attrs['prefix']
+        outputs = self.validation_step_outputs if stage == 'validation' else self.test_step_outputs
+        if not outputs:
+            return {}
+
+        # A single dataloader reports a flat list of step outputs, several report one list each.
+        per_dataloader = [outputs] if isinstance(outputs[0], dict) else list(outputs)
+        names = getattr(self, stage_attrs['names'], None) or [None] * len(per_dataloader)
+
+        logs = {}
+        if self.compute_eval_loss:
+            losses = [step[f'{prefix}_loss'] for outs in per_dataloader for step in outs]
+            logs[f'{prefix}_loss'] = torch.stack(losses).mean()
+
+        results = []
+        for dataloader_idx, dataloader_outputs in enumerate(per_dataloader):
+            dataloader_logs, cp_res, tcp_res = self._score_eval_dataloader(
+                dataloader_outputs, stage, dataloader_idx, names[dataloader_idx]
+            )
+            logs.update(dataloader_logs)
+            results.append((cp_res, tcp_res))
+            dataloader_outputs.clear()  # free memory
+
+        if any(names):
+            for metric_name, pooled in (
+                ('cp', pool_results([cp_res for cp_res, _ in results])),
+                ('tcp', pool_results([tcp_res for _, tcp_res in results])),
+            ):
+                for key in ('wer', 'ins', 'del', 'sub', 'len'):
+                    logs[f'{prefix}/{metric_name}_{key}'] = float(pooled[key])
+
+        # `sync_dist` matches the `sync_metrics=True` NeMo passes here; the scores are already
+        # reduced across ranks by the metric itself, so it only averages equal values.
+        self.log_dict(logs, on_epoch=True, sync_dist=True)
+        return {'log': logs}
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
-        return self._multi_epoch_end(outputs, self._validation_dl, dataloader_idx, prefix='val')
+        """NeMo's per-dataloader hook, kept to its contract.
+
+        `on_validation_epoch_end` scores directly instead, because it also needs the raw counts
+        each dataset contributes to the pooled aggregate.
+        """
+        names = getattr(self, EVAL_STAGES['validation']['names'], None)
+        logs, _, _ = self._score_eval_dataloader(
+            outputs, 'validation', dataloader_idx, names[dataloader_idx] if names else None
+        )
+        return {'log': logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
-        return self._multi_epoch_end(outputs, self._test_dl, dataloader_idx, prefix='test')
+        """See `multi_validation_epoch_end`."""
+        names = getattr(self, EVAL_STAGES['test']['names'], None)
+        logs, _, _ = self._score_eval_dataloader(
+            outputs, 'test', dataloader_idx, names[dataloader_idx] if names else None
+        )
+        return {'log': logs}
+
+    def on_validation_epoch_end(self):
+        """See `_eval_epoch_end`."""
+        # All `ASRModel.on_validation_epoch_end` does before delegating to the logging this
+        # replaces: validation runs inside training, which continues with the graphs disabled.
+        self.disable_cuda_graphs()
+        return self._eval_epoch_end('validation')
+
+    def on_test_epoch_end(self):
+        """See `_eval_epoch_end`. Unlike validation, nothing resumes after testing."""
+        return self._eval_epoch_end('test')
 
     def on_train_epoch_start(self) -> None:
         super().on_train_epoch_start()
@@ -330,6 +436,98 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
         # cuda graphs, which assume a fixed shape.
         WithOptionalCudaGraphs.disable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
         torch.cuda.empty_cache()
+        self._build_eval_metrics('validation')
+
+    def on_test_epoch_start(self) -> None:
+        super().on_test_epoch_start()
+        self._build_eval_metrics('test')
+
+    def _eval_stage(self) -> str:
+        """Which evaluation stage the trainer is currently running."""
+        return 'test' if self._trainer is not None and self.trainer.testing else 'validation'
+
+    def _eval_metric(self, dataloader_idx: int):
+        """The hypothesis accumulator for one dataloader of the running evaluation stage.
+
+        `validation_pass` serves both `validation_step` and `test_step`, which is why the stage is
+        read off the trainer rather than passed in.
+        """
+        return self._eval_metrics(self._eval_stage())[dataloader_idx]
+
+    def _eval_metrics(self, stage: str):
+        """One `MeetevalMTWER` per dataloader of `stage`, built on first use.
+
+        Lightning runs the dataloaders one after another but calls the epoch end only once they
+        have all finished, so a single shared accumulator would pool every dataset's hypotheses
+        and then score that pool against each dataset's references in turn. One accumulator per
+        dataloader keeps them apart.
+        """
+        metrics = getattr(self, EVAL_STAGES[stage]['metrics'], None)
+        return metrics if metrics is not None else self._build_eval_metrics(stage)
+
+    def _build_eval_metrics(self, stage: str):
+        """Build `stage`'s accumulators, one per dataloader.
+
+        Not built in `setup_multiple_validation_data`: NeMo calls that from `ModelPT.__init__`,
+        before `self.decoding` — which the metric decodes through — exists. Rebuilding them at
+        every epoch start also keeps them in step with `change_decoding_strategy`.
+        """
+        stage_attrs = EVAL_STAGES[stage]
+        names = getattr(self, stage_attrs['names'], None)
+        dataloaders = getattr(self, stage_attrs['dataloaders'], None) or []
+        count = len(names) if names else max(len(dataloaders), 1)
+
+        # A plain list, not a `ModuleList`: these hold no parameters and their metric states are
+        # non-persistent, so registering them would only add and remove state_dict entries as the
+        # configured datasets change.
+        metrics = [self._build_meeteval_metric().to(self.device) for _ in range(count)]
+        setattr(self, stage_attrs['metrics'], metrics)
+        return metrics
+
+    def _setup_named_eval_dataloaders(self, config: Optional[Union[DictConfig, Dict]], stage: str) -> None:
+        """Build one dataloader per named evaluation dataset.
+
+        Replaces `nemo.utils.model_utils.resolve_{validation,test}_dataloaders`. That also turns a
+        list of manifests into one dataloader each, but it names them itself and NeMo then logs
+        `<stem>_val/cp_wer` where this model logs `val/<stem>/cp_wer`; and it has no mapping form,
+        which is the only way to name a dataset or to pool several manifests under one name.
+        """
+        stage_attrs = EVAL_STAGES[stage]
+        setattr(self, stage_attrs['dataloaders'], None)
+        setattr(self, stage_attrs['names'], None)
+        setattr(self, stage_attrs['metrics'], None)
+        setattr(self, stage_attrs['nemo_names'], None)
+        setattr(self, stage_attrs['dl_idx'], 0)
+
+        if config is None or config.get('manifest_filepath') is None:
+            return
+
+        # Preserved as written, before the per-dataset copies below narrow it to one manifest.
+        self._update_dataset_config(dataset_name=stage, config=config)
+
+        pairs = named_manifests(config['manifest_filepath'])
+        setup = self.setup_validation_data if stage == 'validation' else self.setup_test_data
+
+        dataloaders = []
+        try:
+            # `_update_dataset_config` is a no-op in this mode, which is what stops the per-dataset
+            # copies from replacing the config just preserved.
+            self._multi_dataset_mode = True
+            for _, manifest in pairs:
+                dataset_config = copy.deepcopy(config)
+                dataset_config['manifest_filepath'] = manifest
+                setup(dataset_config)
+                dataloaders.append(getattr(self, stage_attrs['dataloaders']))
+        finally:
+            self._multi_dataset_mode = False
+
+        names = [name for name, _ in pairs]
+        logging.info("Evaluating %s on %d dataset(s): %s", stage, len(names), ', '.join(names))
+        setattr(self, stage_attrs['dataloaders'], dataloaders)
+        setattr(self, stage_attrs['names'], names)
+        # NeMo's own convention for the same thing, in case anything reads it: its display names
+        # end in an underscore, since it uses them as a metric-key prefix.
+        setattr(self, stage_attrs['nemo_names'], [f'{name}_' for name in names])
 
     def setup_validation_data(self, val_data_config: Optional[Union[DictConfig, Dict]]):
         """Build the validation loader with one item per (session, speaker).
@@ -350,6 +548,14 @@ class EncDecRNNTModelSTNO(EncDecRNNTModel):
 
         self._update_dataset_config(dataset_name='test', config=test_data_config)
         self._test_dl = self._setup_dataloader_from_config(config=test_data_config, val=True)
+
+    def setup_multiple_validation_data(self, val_data_config: Optional[Union[DictConfig, Dict]]):
+        """See `_setup_named_eval_dataloaders`."""
+        self._setup_named_eval_dataloaders(val_data_config, 'validation')
+
+    def setup_multiple_test_data(self, test_data_config: Optional[Union[DictConfig, Dict]]):
+        """See `_setup_named_eval_dataloaders`."""
+        self._setup_named_eval_dataloaders(test_data_config, 'test')
 
     def setup_optimizer_param_groups(self):
         """Optionally give the FDDT parameters their own learning rate.

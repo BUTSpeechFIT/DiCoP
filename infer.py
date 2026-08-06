@@ -37,12 +37,14 @@ sees less of the surrounding non-target speech.
 import argparse
 import math
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 import torch
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -109,8 +111,11 @@ def parse_args():
         "--batch-size",
         type=int,
         default=1,
-        help="Target speakers decoded per forward pass. Features are computed once per session "
-        "regardless. Raise it for short sessions; keep it at 1 for long-form.",
+        help="Target speakers decoded per forward pass, so a session with N speakers never uses "
+        "more than N regardless of what is asked for. Features are computed once per session "
+        "either way. Worth raising for short units and for --chunk-seconds decoding; full-session "
+        "long-form already saturates the GPU at 1, where it buys little and costs memory roughly "
+        "linearly in the batch.",
     )
 
     parser.add_argument(
@@ -169,6 +174,14 @@ def parse_args():
         "--continue-on-fail", action="store_true", help="Log and skip sessions that fail instead of aborting."
     )
     return parser.parse_args()
+
+
+def format_duration(seconds: float) -> str:
+    """h:mm:ss, so a multi-hour decode is readable without counting digits."""
+    total = int(round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"
 
 
 def resolve_output_path(output: Path) -> Path:
@@ -419,7 +432,13 @@ def main():
     speakers_by_session = defaultdict(list)
     failed = []
 
-    for index, unit in enumerate(units, start=1):
+    # Units differ wildly in length, so units/s says little on its own; the postfix carries the
+    # number that does travel between sets — audio seconds decoded per wall-clock second.
+    decode_started = time.monotonic()
+    audio_seconds = 0.0
+    progress = tqdm(units, desc="decoding", unit="unit", dynamic_ncols=True)
+
+    for index, unit in enumerate(progress, start=1):
         speakers = speakers_in(unit.segments, args.min_speech_seconds)
         if not speakers:
             logging.warning("%s has no speaker above --min-speech-seconds; skipping", unit.label)
@@ -444,6 +463,11 @@ def main():
             failed.append(unit.label)
             continue
 
+        audio_seconds += audio.shape[0] / runtime.sample_rate
+        progress.set_postfix_str(
+            f"{audio_seconds / max(time.monotonic() - decode_started, 1e-9):.1f}x realtime"
+        )
+
         for speaker in speakers:
             if speaker not in speakers_by_session[unit.session_id]:
                 speakers_by_session[unit.session_id].append(speaker)
@@ -454,6 +478,9 @@ def main():
 
         words = sum(len(spans_by_speaker.get(speaker, [])) for speaker in speakers)
         logging.info("[%d/%d] %s: %d words decoded", index, len(units), unit.label, words)
+
+    decode_elapsed = time.monotonic() - decode_started
+    progress.close()
 
     session_segments = {}
     session_speakers = {}
@@ -474,6 +501,12 @@ def main():
 
     num_lines = write_stm(output_path, session_segments, session_speakers)
     print(f"Wrote {num_lines} STM lines for {len(session_segments)} sessions to {output_path}")
+    # Model loading is deliberately outside this: it is a fixed cost that says nothing about
+    # how fast the set decodes, and on a Hub id it is mostly download time.
+    print(
+        f"Decoded {format_duration(audio_seconds)} of audio in {format_duration(decode_elapsed)} "
+        f"({audio_seconds / max(decode_elapsed, 1e-9):.1f}x realtime)"
+    )
     if failed:
         print(f"{len(failed)} units failed: {', '.join(failed)}")
 

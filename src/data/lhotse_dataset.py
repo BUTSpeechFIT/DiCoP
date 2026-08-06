@@ -9,6 +9,11 @@ and validation. This differs from the NeMo-manifest dataset, which samples one r
 speaker per session per training epoch: a Lhotse epoch therefore covers every speaker of every
 cut, and is correspondingly longer.
 
+`manifest_filepath` may name several CutSets, which are concatenated into a single dataset —
+the way corpora are mixed for training. There is no per-corpus weighting: an epoch is every
+(cut, speaker) pair of every CutSet, so each corpus contributes in proportion to the items it
+holds, and the split is logged at startup (`scripts/run_train.sh`).
+
 `MonoCut` and `MixedCut` are both accepted, the same pair `infer.py` decodes. A `MixedCut` (the
 LibriMix / LibriSpeechMix mixtures) names no audio file — it is a recipe for summing its tracks —
 so `load_cut_audio` renders it rather than reading a path, and `channel_selector` and `trim` do
@@ -19,6 +24,8 @@ See `src/data/lhotse_utils.py` for why Lhotse's own dataloading stack is not use
 times map onto the NeMo manifest's.
 """
 
+from bisect import bisect_right
+from collections import Counter
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
 
@@ -31,7 +38,13 @@ from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskTyp
 from nemo.utils import logging
 
 from src.data.dataset import _TokenizerWrapper, speech_collate_fn
-from src.data.lhotse_utils import cut_session_id, load_cut_audio, load_cutset, require_supported_cut
+from src.data.lhotse_utils import (
+    cut_session_id,
+    load_cut_audio,
+    load_cutset,
+    manifest_paths,
+    require_supported_cut,
+)
 from src.data.stno import (
     SpeechSegment,
     create_stno_masks,
@@ -58,7 +71,11 @@ class LhotseToBPEAndSTNODataset(Dataset):
     """Yields `(audio, tokens, stno_mask)` for one (cut, target speaker) pair.
 
     Args:
-        manifest_filepath: Path to a Lhotse CutSet (`.jsonl.gz` / `.jsonl`).
+        manifest_filepath: Path to a Lhotse CutSet (`.jsonl.gz` / `.jsonl`), or several of them
+            as a list or a comma-separated string. Several CutSets are concatenated into one
+            dataset, which is how a mixture of corpora is trained on simultaneously: an epoch
+            covers every (cut, speaker) pair of every CutSet, so each contributes in proportion
+            to the items it holds.
         tokenizer: A `nemo.collections.common.tokenizers.TokenizerSpec` subclass.
         sample_rate: Sample rate to resample loaded audio to.
         int_values: If True, load samples as 32-bit integers.
@@ -125,15 +142,18 @@ class LhotseToBPEAndSTNODataset(Dataset):
         else:
             self.pad_id = 0
 
-        if isinstance(manifest_filepath, (list, tuple)):
-            if len(manifest_filepath) != 1:
-                raise ValueError(
-                    f"A Lhotse dataset takes a single CutSet path, got {len(manifest_filepath)}."
-                )
-            manifest_filepath = manifest_filepath[0]
+        # Several CutSets are read into one flat list, so training on a mixture of corpora is
+        # just a longer manifest: cut order is the order they are listed in, and a cut's index
+        # stays its identity for `segments_collection` and the emitted utt_id.
+        self.cutset_paths = manifest_paths(manifest_filepath)
 
         # Materialized once for O(1) indexing. Cuts are metadata only, so this is cheap.
-        self.cuts = list(load_cutset(manifest_filepath))
+        self.cuts = []
+        source_starts: List[int] = []
+        for path in self.cutset_paths:
+            source_starts.append(len(self.cuts))
+            self.cuts.extend(load_cutset(path))
+
         self.parser = _TokenizerWrapper(tokenizer, text_norm_type)
 
         # Tokenize up front: the transcript, the STNO mask and the scoring references all read
@@ -213,6 +233,8 @@ class LhotseToBPEAndSTNODataset(Dataset):
             total_duration / 3600,
             len(self.spk_cut_list),
         )
+        if len(self.cutset_paths) > 1:
+            self._log_composition(source_starts)
 
         self.val = val
         self.featurizer = WaveformFeaturizer(sample_rate=sample_rate, int_values=int_values, augmentor=augmentor)
@@ -220,6 +242,51 @@ class LhotseToBPEAndSTNODataset(Dataset):
         self.channel_selector = channel_selector
         self.audio_downsampling_factor = audio_downsampling_factor
         self.frame_rate = frame_rate_from_downsampling_factor(sample_rate, audio_downsampling_factor)
+
+    def _log_composition(self, source_starts: List[int]) -> None:
+        """Report what each CutSet contributed to a mixture, and flag colliding session ids.
+
+        An epoch over several corpora is sampled in proportion to the (cut, speaker) items each
+        one contributes, not to its hours, so that share is the thing worth printing: it is what
+        a mixture is actually trained on.
+
+        Session ids are the scoring key, so two corpora using the same one would have their
+        hypotheses merged into a single session by the multi-talker metric. That is a property of
+        the manifests rather than something this loader can fix, hence a warning.
+        """
+        def source_of(cut_index: int) -> int:
+            """Which CutSet a cut index fell in, from where each one started in the flat list."""
+            return bisect_right(source_starts, cut_index) - 1
+
+        kept, hours, items = Counter(), Counter(), Counter()
+        for cut_index in self.tokenized:
+            kept[source_of(cut_index)] += 1
+            hours[source_of(cut_index)] += self.cuts[cut_index].duration / 3600
+        for cut_index, _ in self.spk_cut_list:
+            items[source_of(cut_index)] += 1
+
+        total_items = max(len(self.spk_cut_list), 1)
+        for source, path in enumerate(self.cutset_paths):
+            logging.info(
+                "  %5.1f%% of the epoch: %d cuts, %.2f h, %d items <- %s",
+                100 * items[source] / total_items,
+                kept[source],
+                hours[source],
+                items[source],
+                path,
+            )
+
+        sources_by_session: Dict[str, set] = {}
+        for cut_index, session_id in self.session_ids.items():
+            sources_by_session.setdefault(session_id, set()).add(source_of(cut_index))
+        collisions = sorted(session for session, sources in sources_by_session.items() if len(sources) > 1)
+        if collisions:
+            logging.warning(
+                "%d session ids occur in more than one CutSet (e.g. %s). Scoring keys on the "
+                "session id, so those recordings will be scored as one session.",
+                len(collisions),
+                ', '.join(collisions[:5]),
+            )
 
     def __len__(self):
         return len(self.spk_cut_list)

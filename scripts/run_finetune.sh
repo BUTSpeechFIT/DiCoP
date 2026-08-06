@@ -263,7 +263,9 @@ fi
 cmd=("$PYTHON" "$REPO_ROOT/train.py")
 cmd+=("+init_from_ptl_ckpt=$INIT_CKPT")
 cmd+=("model.train_ds.manifest_filepath=$TRAIN_CUTS")
-cmd+=("model.validation_ds.manifest_filepath=$VAL_CUTS_PATH")
+# Named, so the curve is val/$CORPUS/cp_wer rather than the subset file's stem. `val/cp_wer`,
+# which checkpoints are selected on, is logged alongside it and is the same number here.
+cmd+=("model.validation_ds.manifest_filepath={$CORPUS:'$VAL_CUTS_PATH'}")
 cmd+=("model.train_ds.batch_size=$BATCH_SIZE")
 cmd+=("model.optim.lr=$LR")
 cmd+=("model.optim.sched.warmup_steps=$WARMUP_STEPS")
