@@ -32,6 +32,12 @@ still does not fit, either restrict the attention window (`--att-context-size 12
 to windowed local attention (`-O model.encoder.self_attention_model=rel_pos_local_attn`), or
 decode in windows (`--chunk-seconds 120`), which costs accuracy because the conditioning
 sees less of the surrounding non-target speech.
+
+The same applies to batching speakers. `--per-speaker-batching` decodes all of a session's
+speakers in one pass off the single spectrogram the audio was loaded and preprocessed into, which
+is the fast way to run short units and `--chunk-seconds` windows, but it multiplies the encoder's
+activation memory by the speaker count, so on full-session long-form the default of one speaker
+per pass is the safe choice.
 """
 
 import argparse
@@ -110,12 +116,21 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
-        help="Target speakers decoded per forward pass, so a session with N speakers never uses "
-        "more than N regardless of what is asked for. Features are computed once per session "
-        "either way. Worth raising for short units and for --chunk-seconds decoding; full-session "
-        "long-form already saturates the GPU at 1, where it buys little and costs memory roughly "
-        "linearly in the batch.",
+        default=None,
+        help="Target speakers decoded per forward pass (default 1), so a session with N speakers "
+        "never uses more than N regardless of what is asked for. Features are computed once per "
+        "session either way. Worth raising for short units and for --chunk-seconds decoding; "
+        "full-session long-form already saturates the GPU at 1, where it buys little and costs "
+        "memory roughly linearly in the batch.",
+    )
+    parser.add_argument(
+        "--per-speaker-batching",
+        action="store_true",
+        help="Decode every speaker of a unit in one forward pass, so the batch follows the unit "
+        "instead of a fixed --batch-size. The audio is loaded and the features computed once "
+        "either way; this only removes the per-speaker passes over them. Peak memory scales with "
+        "the session's speaker count, so it pairs best with --chunk-seconds decoding. Cannot be "
+        "combined with --batch-size.",
     )
 
     parser.add_argument(
@@ -327,6 +342,21 @@ def build_windows(num_samples, chunk_seconds, overlap_seconds, sample_rate, samp
     return windows
 
 
+def speaker_batches(speakers, per_speaker_batching, batch_size):
+    """Group target speakers into the sets decoded in one forward pass.
+
+    Every group shares one spectrogram, so grouping only trades memory against passes; it never
+    changes what is decoded. `per_speaker_batching` makes that group the whole unit, so all of a
+    session's speakers are inferred simultaneously, each with its own STNO mask.
+
+    Yields:
+        Lists of speaker ids, in the order given.
+    """
+    size = len(speakers) if per_speaker_batching else batch_size
+    for start in range(0, len(speakers), max(size, 1)):
+        yield speakers[start : start + size]
+
+
 def decode_session(runtime, audio, segments, speakers, args):
     """Decode every target speaker of one session.
 
@@ -358,8 +388,7 @@ def decode_session(runtime, audio, segments, speakers, args):
 
         processed_signal, processed_signal_length = runtime.preprocess(window_audio)
 
-        for batch_start in range(0, len(speakers), args.batch_size):
-            batch_speakers = speakers[batch_start : batch_start + args.batch_size]
+        for batch_speakers in speaker_batches(speakers, args.per_speaker_batching, args.batch_size):
             masks = torch.stack(
                 [create_stno_masks(activity, speakers.index(speaker)) for speaker in batch_speakers]
             )
@@ -382,6 +411,16 @@ def decode_session(runtime, audio, segments, speakers, args):
 
 def main():
     args = parse_args()
+
+    if args.per_speaker_batching and args.batch_size is not None:
+        raise ValueError(
+            "--per-speaker-batching decides the batch from the unit's speaker count; "
+            "--batch-size cannot also be set."
+        )
+    if args.batch_size is not None and args.batch_size < 1:
+        raise ValueError(f"--batch-size must be at least 1, got {args.batch_size}")
+    if args.batch_size is None:
+        args.batch_size = 1
 
     output_path = resolve_output_path(args.output)
     extensions = [e if e.startswith(".") else f".{e}" for e in args.audio_ext.split(",") if e]
@@ -420,7 +459,14 @@ def main():
         overrides=args.overrides,
     )
 
-    if args.chunk_seconds <= 0 and args.batch_size > 1:
+    if args.chunk_seconds <= 0 and args.per_speaker_batching:
+        logging.warning(
+            "--per-speaker-batching with full-session decoding puts every speaker of a session "
+            "in one forward pass, so peak memory scales with the speaker count and can exhaust "
+            "the GPU on long recordings; --chunk-seconds, --att-context-size, or a fixed "
+            "--batch-size keep it bounded."
+        )
+    elif args.chunk_seconds <= 0 and args.batch_size > 1:
         logging.warning(
             "--batch-size %d with full-session decoding can exhaust GPU memory on long "
             "recordings; 1 is the safe choice.",

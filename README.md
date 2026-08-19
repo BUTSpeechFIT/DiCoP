@@ -104,6 +104,7 @@ Useful options:
 |---|---|
 | `--stm-granularity word\|segment` | One line per word (default) or grouped by pauses. |
 | `--batch-size N` | How many target speakers are decoded per forward pass. |
+| `--per-speaker-batching` | Decode every speaker of a session in one forward pass, instead of a fixed `--batch-size`. |
 | `--min-speech-seconds S` | Skip speakers with less than `S` seconds of total speech. |
 | `--chunk-seconds S` | Decode in windows instead of whole sessions (for long recordings). |
 | `-O KEY=VALUE` | Override any config key, can be repeated. |
